@@ -245,7 +245,7 @@ const Index = () => {
                       <SelectValue placeholder="All Levels" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">All Levels</SelectItem>
+                      <SelectItem value="all">All Levels</SelectItem>
                       <SelectItem value="pre-school">Pre-School</SelectItem>
                       <SelectItem value="primary">Primary</SelectItem>
                       <SelectItem value="secondary">Secondary</SelectItem>
@@ -261,7 +261,7 @@ const Index = () => {
                       <SelectValue placeholder="All Terms" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">All Terms</SelectItem>
+                      <SelectItem value="all">All Terms</SelectItem>
                       <SelectItem value="term1">Term 1</SelectItem>
                       <SelectItem value="term2">Term 2</SelectItem>
                       <SelectItem value="term3">Term 3</SelectItem>
@@ -289,7 +289,7 @@ const Index = () => {
                       <SelectValue placeholder="All Subjects" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">All Subjects</SelectItem>
+                      <SelectItem value="all">All Subjects</SelectItem>
                       <SelectItem value="math">Mathematics</SelectItem>
                       <SelectItem value="english">English</SelectItem>
                       <SelectItem value="science">Science</SelectItem>
