@@ -3,6 +3,9 @@ import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { AuthProvider } from "@/hooks/useAuth";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import Auth from "./pages/Auth";
 import Dashboard from "./pages/Dashboard";
 import Beneficiaries from "./pages/Beneficiaries";
 import EducationLevels from "./pages/EducationLevels";
@@ -33,33 +36,114 @@ const App = () => (
       <Toaster />
       <Sonner />
       <BrowserRouter>
-        <Routes>
-          {/* Admin Routes */}
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/beneficiaries" element={<Beneficiaries />} />
-          <Route path="/education" element={<EducationLevels />} />
-          <Route path="/education/:level" element={<EducationLevels />} />
-          <Route path="/financial-aid" element={<FinancialAid />} />
-          <Route path="/admin/receipts" element={<AdminReceipts />} />
-          <Route path="/admin/statements" element={<AdminStatements />} />
-          <Route path="/performance" element={<Performance />} />
-          <Route path="/calendar" element={<AcademicCalendar />} />
-          <Route path="/communication" element={<Communication />} />
-          <Route path="/settings" element={<SystemSettings />} />
-          
-          {/* Beneficiary Portal Routes */}
-          <Route path="/portal" element={<PortalDashboard />} />
-          <Route path="/portal/documents" element={<PortalDocuments />} />
-          <Route path="/portal/upload" element={<PortalUpload />} />
-          <Route path="/portal/statements" element={<PortalStatements />} />
-          <Route path="/portal/receipts" element={<PortalReceipts />} />
-          <Route path="/portal/academics" element={<PortalAcademics />} />
-          <Route path="/portal/messages" element={<PortalMessages />} />
-          <Route path="/portal/profile" element={<PortalProfile />} />
-          
-          {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
-          <Route path="*" element={<NotFound />} />
-        </Routes>
+        <AuthProvider>
+          <Routes>
+            {/* Auth Route */}
+            <Route path="/auth" element={<Auth />} />
+            
+            {/* Admin Routes - Protected */}
+            <Route path="/" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <Dashboard />
+              </ProtectedRoute>
+            } />
+            <Route path="/beneficiaries" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <Beneficiaries />
+              </ProtectedRoute>
+            } />
+            <Route path="/education" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <EducationLevels />
+              </ProtectedRoute>
+            } />
+            <Route path="/education/:level" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <EducationLevels />
+              </ProtectedRoute>
+            } />
+            <Route path="/financial-aid" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <FinancialAid />
+              </ProtectedRoute>
+            } />
+            <Route path="/admin/receipts" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminReceipts />
+              </ProtectedRoute>
+            } />
+            <Route path="/admin/statements" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminStatements />
+              </ProtectedRoute>
+            } />
+            <Route path="/performance" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <Performance />
+              </ProtectedRoute>
+            } />
+            <Route path="/calendar" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AcademicCalendar />
+              </ProtectedRoute>
+            } />
+            <Route path="/communication" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <Communication />
+              </ProtectedRoute>
+            } />
+            <Route path="/settings" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <SystemSettings />
+              </ProtectedRoute>
+            } />
+            
+            {/* Beneficiary Portal Routes - Protected */}
+            <Route path="/portal" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalDashboard />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/documents" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalDocuments />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/upload" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalUpload />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/statements" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalStatements />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/receipts" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalReceipts />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/academics" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalAcademics />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/messages" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalMessages />
+              </ProtectedRoute>
+            } />
+            <Route path="/portal/profile" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalProfile />
+              </ProtectedRoute>
+            } />
+            
+            {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </AuthProvider>
       </BrowserRouter>
     </TooltipProvider>
   </QueryClientProvider>
