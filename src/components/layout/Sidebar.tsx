@@ -43,6 +43,8 @@ const Sidebar = ({ collapsed, onToggle }: SidebarProps) => {
       ]
     },
     { title: 'Financial Aid', icon: DollarSign, path: '/financial-aid' },
+    { title: 'Receipts', icon: DollarSign, path: '/admin/receipts' },
+    { title: 'Fee Statements', icon: DollarSign, path: '/admin/statements' },
     { title: 'Performance Analytics', icon: BarChart, path: '/performance' },
     { title: 'Academic Calendar', icon: Calendar, path: '/calendar' },
     { title: 'Communication', icon: Mail, path: '/communication' },
