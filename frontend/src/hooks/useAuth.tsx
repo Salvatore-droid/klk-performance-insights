@@ -18,7 +18,7 @@ interface AuthContextType {
   token: string | null;
   role: AppRole | null;
   loading: boolean;
-  signIn: (email: string, password: string) => Promise<{ error: string | null }>;
+  signIn: (email: string, password: string, isAdmin?: boolean) => Promise<{ error: string | null }>;
   signUp: (email: string, password: string, fullName: string) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
   changePassword: (currentPassword: string, newPassword: string, confirmPassword: string) => Promise<{ error: string | null }>;
@@ -88,7 +88,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   };
 
-  const signIn = async (email: string, password: string): Promise<{ error: string | null }> => {
+  const signIn = async (email: string, password: string, isAdmin: boolean = false): Promise<{ error: string | null }> => {
     try {
       setLoading(true);
       
@@ -104,6 +104,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       if (!response.ok) {
         return { error: data.error || 'Login failed' };
+      }
+
+      // Check if user has admin privileges if logging in as admin
+      if (isAdmin && !data.user.is_admin && data.user.role !== 'admin') {
+        return { error: 'Admin privileges required. Please use admin credentials.' };
       }
 
       // Store token and user data
@@ -323,7 +328,7 @@ export const apiRequest = async <T = any>(
   token?: string | null
 ): Promise<{ data?: T; error?: string; response?: Response }> => {
   const headers = {
-    'Content-Type': 'application/json',
+    'Content-Type': 'json',
     ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
     ...options.headers,
   };

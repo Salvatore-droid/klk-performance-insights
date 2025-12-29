@@ -2,7 +2,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Auth from "./pages/Auth";
@@ -42,11 +42,19 @@ const App = () => (
             <Route path="/auth" element={<Auth />} />
             
             {/* Admin Routes - Protected */}
+            {/* ADD THIS ROUTE FOR /admin/dashboard */}
+            <Route path="/admin/dashboard" element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <Dashboard />
+              </ProtectedRoute>
+            } />
+            
             <Route path="/" element={
               <ProtectedRoute allowedRoles={['admin']}>
                 <Dashboard />
               </ProtectedRoute>
             } />
+            
             <Route path="/beneficiaries" element={
               <ProtectedRoute allowedRoles={['admin']}>
                 <Beneficiaries />
@@ -99,6 +107,13 @@ const App = () => (
             } />
             
             {/* Beneficiary Portal Routes - Protected */}
+            {/* ADD THIS ROUTE FOR /portal/dashboard */}
+            <Route path="/portal/dashboard" element={
+              <ProtectedRoute allowedRoles={['beneficiary']}>
+                <PortalDashboard />
+              </ProtectedRoute>
+            } />
+            
             <Route path="/portal" element={
               <ProtectedRoute allowedRoles={['beneficiary']}>
                 <PortalDashboard />
@@ -139,6 +154,11 @@ const App = () => (
                 <PortalProfile />
               </ProtectedRoute>
             } />
+            
+            {/* Default redirects */}
+            <Route path="/" element={<Navigate to="/auth" replace />} />
+            <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
+            <Route path="/portal" element={<Navigate to="/portal/dashboard" replace />} />
             
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />

@@ -38,7 +38,7 @@ type UserType = 'admin' | 'beneficiary';
 
 const Auth = () => {
   const navigate = useNavigate();
-  const { user, role, loading, signIn, signUp } = useAuth();
+  const { user, role, loading, signIn, signUp, signOut } = useAuth();
   const { toast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
   const [selectedUserType, setSelectedUserType] = useState<UserType>('beneficiary');
@@ -108,14 +108,33 @@ const Auth = () => {
   };
 
   useEffect(() => {
+    console.log('Auth useEffect triggered:', { loading, user, role, selectedUserType });
+    
     if (!loading && user && role) {
+      console.log('Redirecting... Role:', role, 'Selected Type:', selectedUserType);
+      
+      // If user selected admin but doesn't have admin role, show error and logout
+      if (selectedUserType === 'admin' && role !== 'admin') {
+        toast({
+          title: 'Access Denied',
+          description: 'You need admin privileges to access the admin portal.',
+          variant: 'destructive',
+        });
+        // Clear the auth state since they can't access admin
+        signOut();
+        return;
+      }
+      
+      // Redirect based on actual role
       if (role === 'admin') {
-        navigate('/', { replace: true });
+        console.log('Navigating to admin dashboard');
+        navigate('/admin/dashboard', { replace: true });
       } else {
-        navigate('/portal', { replace: true });
+        console.log('Navigating to beneficiary dashboard');
+        navigate('/portal/dashboard', { replace: true });
       }
     }
-  }, [user, role, loading, navigate]);
+  }, [user, role, loading, navigate, selectedUserType, toast, signOut]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -145,7 +164,12 @@ const Auth = () => {
     setIsLoading(true);
     setFormErrors({});
     
-    const { error } = await signIn(loginEmail.trim(), loginPassword);
+    // Pass isAdmin parameter based on selected user type
+    const { error } = await signIn(
+      loginEmail.trim(), 
+      loginPassword,
+      selectedUserType === 'admin'
+    );
     
     setIsLoading(false);
 
@@ -155,6 +179,8 @@ const Auth = () => {
       // Map common backend errors to user-friendly messages
       if (error.includes('Invalid email or password')) {
         errorMessage = 'Invalid email or password. Please try again.';
+      } else if (error.includes('Admin privileges required')) {
+        errorMessage = 'Admin privileges required. Please use admin credentials.';
       } else if (error.includes('account is not active')) {
         errorMessage = 'Your account is not active. Please contact support.';
       } else if (error.includes('network error') || error.includes('Network error')) {
@@ -167,6 +193,7 @@ const Auth = () => {
         variant: 'destructive',
       });
     }
+    // Don't navigate here - let the useEffect handle it
   };
 
   const handleSignup = async (e: React.FormEvent) => {
