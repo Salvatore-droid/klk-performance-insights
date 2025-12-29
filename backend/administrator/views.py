@@ -8,18 +8,24 @@ from django.db import transaction
 from decimal import Decimal
 import logging
 from django.utils import timezone
-import pytz
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+import os
+from django.contrib.auth.models import User
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
 
 # Import base app utilities
 from base.views import verify_jwt_token
 
 # Import models
-from django.contrib.auth.models import User
-from base.models import (
+from .models import (
+    EducationLevel, GradeClass, EducationLevelStats, GradeStats,
     UserProfile, Document, FeeStatement, Payment, 
-    AcademicRecord, AcademicSummary, Message
+    AcademicRecord, AcademicSummary, Message,
+    AdminDashboardStats, AdminNotification, AuditLog, SystemSetting,
+    CalendarEvent, AcademicTerm
 )
-from .models import AdminDashboardStats, AdminNotification, AuditLog, SystemSetting
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +81,1048 @@ def create_audit_log(user, action_type, model_name, object_id, description, requ
     except Exception as e:
         logger.error(f"Failed to create audit log: {e}")
 
+# In your views.py, update the education level views:
+@csrf_exempt
+def get_education_levels(request):
+    """Get all education levels with statistics"""
+    try:
+        user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        # Get all active education levels
+        education_levels = EducationLevel.objects.filter(is_active=True).order_by('order')
+        
+        levels_data = []
+        for level in education_levels:
+            # Get statistics
+            stats, _ = EducationLevelStats.objects.get_or_create(education_level=level)
+            
+            # Get grades for this level
+            grades = GradeClass.objects.filter(
+                education_level=level,
+                is_active=True
+            ).order_by('order')
+            
+            levels_data.append({
+                'id': level.id,
+                'key': level.level_key,
+                'title': level.title,
+                'description': level.description,
+                'icon_name': level.icon_name,
+                'color_gradient': level.color_gradient,
+                'order': level.order,
+                'is_active': level.is_active,
+                'stats': {
+                    'total_students': stats.total_students,
+                    'active_students': stats.active_students,
+                    'average_performance': float(stats.average_performance),
+                    'passing_rate': float(stats.passing_rate),
+                },
+                'grades': [{
+                    'id': grade.id,
+                    'name': grade.name,
+                    'short_code': grade.short_code,
+                    'description': grade.description
+                } for grade in grades]
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'education_levels': levels_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Get education levels error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to fetch education levels: ' + str(e)
+        }, status=500)
+
+@csrf_exempt
+def get_education_level_detail(request, level_key):
+    """Get detailed information about a specific education level"""
+    try:
+        user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        # Get education level
+        try:
+            level = EducationLevel.objects.get(level_key=level_key, is_active=True)
+        except EducationLevel.DoesNotExist:
+            return JsonResponse({
+                'success': False,
+                'error': 'Education level not found'
+            }, status=404)
+        
+        # Get statistics
+        stats, _ = EducationLevelStats.objects.get_or_create(education_level=level)
+        
+        # Get grades
+        grades = GradeClass.objects.filter(education_level=level, is_active=True).order_by('order')
+        
+        # Get students in this level
+        students = UserProfile.objects.filter(
+            education_level=level,
+            role='beneficiary'
+        ).select_related('user', 'grade_class').order_by('grade_class__order')
+        
+        # Prepare student statistics by grade
+        grade_stats = []
+        for grade in grades:
+            grade_students = students.filter(grade_class=grade)
+            grade_stat, _ = GradeStats.objects.get_or_create(grade_class=grade)
+            
+            grade_stats.append({
+                'grade': {
+                    'id': grade.id,
+                    'name': grade.name,
+                    'short_code': grade.short_code
+                },
+                'student_count': grade_students.count(),
+                'average_performance': float(grade_stat.average_performance),
+                'average_attendance': float(grade_stat.average_attendance),
+                'male_students': grade_stat.male_students,
+                'female_students': grade_stat.female_students
+            })
+        
+        # Recent activities (payments and documents)
+        recent_activities = []
+        user_ids = students.values_list('user_id', flat=True)
+        
+        # Recent documents
+        recent_docs = Document.objects.filter(
+            user_id__in=user_ids
+        ).select_related('user').order_by('-uploaded_at')[:5]
+        for doc in recent_docs:
+            recent_activities.append({
+                'id': f"doc_{doc.id}",
+                'type': 'document',
+                'title': f"Document uploaded: {doc.name}",
+                'user': f"{doc.user.first_name} {doc.user.last_name}".strip() or doc.user.username,
+                'grade': doc.user.profile.grade_name if hasattr(doc.user, 'profile') else 'N/A',
+                'time': doc.uploaded_at.isoformat(),
+                'status': doc.status
+            })
+        
+        # Recent payments
+        recent_payments = Payment.objects.filter(
+            user_id__in=user_ids
+        ).select_related('user').order_by('-created_at')[:5]
+        for payment in recent_payments:
+            recent_activities.append({
+                'id': f"pay_{payment.id}",
+                'type': 'payment',
+                'title': f"Payment submitted: KES {payment.amount}",
+                'user': f"{payment.user.first_name} {payment.user.last_name}".strip() or payment.user.username,
+                'grade': payment.user.profile.grade_name if hasattr(payment.user, 'profile') else 'N/A',
+                'time': payment.created_at.isoformat(),
+                'status': payment.status
+            })
+        
+        # Sort by time
+        recent_activities.sort(key=lambda x: x['time'], reverse=True)
+        recent_activities = recent_activities[:8]
+        
+        # Performance trends (last 3 academic terms)
+        from django.db.models import Subquery, OuterRef
+        recent_terms = AcademicSummary.objects.filter(
+            user_id__in=user_ids
+        ).values('term', 'year').distinct().order_by('-year', '-term')[:3]
+        
+        performance_trends = []
+        for term_data in recent_terms:
+            avg_performance = AcademicSummary.objects.filter(
+                user_id__in=user_ids,
+                term=term_data['term'],
+                year=term_data['year']
+            ).aggregate(avg=Avg('average_score'))['avg'] or 0
+            
+            performance_trends.append({
+                'term': f"{term_data['term']} {term_data['year']}",
+                'average_performance': float(avg_performance)
+            })
+        
+        # County distribution for this level
+        county_distribution = students.exclude(
+            county__isnull=True
+        ).exclude(county='').values('county').annotate(
+            count=Count('id')
+        ).order_by('-count')[:5]
+        
+        return JsonResponse({
+            'success': True,
+            'education_level': {
+                'id': level.id,
+                'key': level.level_key,
+                'title': level.title,
+                'description': level.description,
+                'icon': level.icon_name,
+                'color_gradient': level.color_gradient,
+                'is_active': level.is_active,
+                'order': level.order
+            },
+            'statistics': {
+                'total_students': stats.total_students,
+                'active_students': stats.active_students,
+                'pending_verification': stats.pending_verification,
+                'new_this_month': stats.new_this_month,
+                'average_performance': float(stats.average_performance),
+                'passing_rate': float(stats.passing_rate),
+                'total_fees': float(stats.total_fees),
+                'total_paid': float(stats.total_paid),
+                'total_aid_disbursed': float(stats.total_aid_disbursed),
+                'pending_documents': stats.pending_documents,
+                'approved_documents': stats.approved_documents
+            },
+            'grades': grade_stats,
+            'recent_activities': recent_activities,
+            'performance_trends': performance_trends,
+            'county_distribution': list(county_distribution)
+        })
+        
+    except Exception as e:
+        logger.error(f"Get education level detail error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to fetch education level details'
+        }, status=500)
+
+@csrf_exempt
+def get_grade_students(request, grade_id):
+    """Get students in a specific grade/class"""
+    try:
+        user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        # Get query parameters
+        page = int(request.GET.get('page', 1))
+        limit = int(request.GET.get('limit', 10))
+        search = request.GET.get('search', '')
+        
+        # Get grade
+        try:
+            grade = GradeClass.objects.get(id=grade_id, is_active=True)
+        except GradeClass.DoesNotExist:
+            return JsonResponse({
+                'success': False,
+                'error': 'Grade/Class not found'
+            }, status=404)
+        
+        # Build query
+        query = Q(grade_class=grade, role='beneficiary')
+        
+        if search:
+            query &= (
+                Q(user__first_name__icontains=search) |
+                Q(user__last_name__icontains=search) |
+                Q(user__email__icontains=search) |
+                Q(admission_number__icontains=search) |
+                Q(school__icontains=search)
+            )
+        
+        # Get students
+        students = UserProfile.objects.filter(query).select_related('user').order_by('user__last_name')
+        
+        # Get grade statistics
+        grade_stats, _ = GradeStats.objects.get_or_create(grade_class=grade)
+        
+        # Paginate
+        paginator = Paginator(students, limit)
+        page_obj = paginator.get_page(page)
+        
+        # Format response
+        students_list = []
+        for profile in page_obj:
+            # Get latest academic performance
+            latest_academic = AcademicSummary.objects.filter(
+                user=profile.user
+            ).order_by('-year', '-term').first()
+            
+            # Get fee status
+            fee_statements = FeeStatement.objects.filter(user=profile.user)
+            total_fees = fee_statements.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
+            total_paid = fee_statements.aggregate(total=Sum('amount_paid'))['total'] or Decimal('0')
+            balance = total_fees - total_paid
+            
+            students_list.append({
+                'id': profile.user.id,
+                'full_name': profile.full_name,
+                'email': profile.user.email,
+                'phone_number': profile.phone_number,
+                'school': profile.school,
+                'admission_number': profile.admission_number,
+                'gender': profile.gender,
+                'county': profile.county,
+                'sponsorship_status': profile.sponsorship_status,
+                'is_verified': profile.is_verified,
+                'registration_date': profile.registration_date.isoformat(),
+                'academic_performance': float(latest_academic.average_score) if latest_academic else 0,
+                'attendance': float(latest_academic.attendance_percentage) if latest_academic else 0,
+                'total_fees': str(total_fees),
+                'total_paid': str(total_paid),
+                'balance': str(balance),
+                'profile_image_url': request.build_absolute_uri(profile.profile_image.url) if profile.profile_image else None
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'grade': {
+                'id': grade.id,
+                'name': grade.name,
+                'short_code': grade.short_code,
+                'description': grade.description,
+                'education_level': {
+                    'id': grade.education_level.id,
+                    'title': grade.education_level.title,
+                    'key': grade.education_level.level_key
+                }
+            },
+            'statistics': {
+                'total_students': grade_stats.total_students,
+                'male_students': grade_stats.male_students,
+                'female_students': grade_stats.female_students,
+                'average_performance': float(grade_stats.average_performance),
+                'average_attendance': float(grade_stats.average_attendance)
+            },
+            'students': students_list,
+            'pagination': {
+                'current_page': page_obj.number,
+                'total_pages': paginator.num_pages,
+                'total_count': paginator.count,
+                'has_next': page_obj.has_next(),
+                'has_previous': page_obj.has_previous()
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Get grade students error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to fetch grade students'
+        }, status=500)
+
+@csrf_exempt
+def get_education_dashboard(request):
+    """Get education dashboard overview"""
+    try:
+        user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        # Get all education levels
+        education_levels = EducationLevel.objects.filter(is_active=True).order_by('order')
+        
+        # Overall statistics
+        total_students = UserProfile.objects.filter(role='beneficiary').count()
+        active_students = UserProfile.objects.filter(role='beneficiary', sponsorship_status='active').count()
+        
+        # Academic performance across all levels
+        all_students = UserProfile.objects.filter(role='beneficiary')
+        user_ids = all_students.values_list('user_id', flat=True)
+        
+        latest_summaries = AcademicSummary.objects.filter(
+            user_id__in=user_ids
+        ).order_by('user_id', '-year', '-term').distinct('user_id')
+        
+        overall_average = 0
+        if latest_summaries.exists():
+            overall_average = latest_summaries.aggregate(
+                avg=Avg('average_score')
+            )['avg'] or 0
+        
+        # Prepare level statistics
+        level_stats = []
+        for level in education_levels:
+            stats, _ = EducationLevelStats.objects.get_or_create(education_level=level)
+            
+            level_stats.append({
+                'key': level.level_key,
+                'title': level.title,
+                'icon': level.icon_name,
+                'color_gradient': level.color_gradient,
+                'total_students': stats.total_students,
+                'active_students': stats.active_students,
+                'average_performance': float(stats.average_performance),
+                'passing_rate': float(stats.passing_rate)
+            })
+        
+        # Top performing grades
+        top_grades = GradeStats.objects.filter(
+            grade_class__is_active=True
+        ).select_related('grade_class__education_level').order_by('-average_performance')[:5]
+        
+        top_grades_list = []
+        for grade_stat in top_grades:
+            top_grades_list.append({
+                'grade': grade_stat.grade_class.name,
+                'education_level': grade_stat.grade_class.education_level.title,
+                'average_performance': float(grade_stat.average_performance),
+                'total_students': grade_stat.total_students
+            })
+        
+        # Recent enrollments by education level
+        today = timezone.now().date()
+        current_month_start = today.replace(day=1)
+        
+        recent_enrollments = []
+        for level in education_levels:
+            new_students = UserProfile.objects.filter(
+                education_level=level,
+                role='beneficiary',
+                registration_date__gte=current_month_start
+            ).count()
+            
+            if new_students > 0:
+                recent_enrollments.append({
+                    'level': level.title,
+                    'new_students': new_students,
+                    'color': level.color_gradient.split(' ')[0].replace('from-', '')
+                })
+        
+        return JsonResponse({
+            'success': True,
+            'dashboard': {
+                'overall_stats': {
+                    'total_students': total_students,
+                    'active_students': active_students,
+                    'overall_average_performance': float(overall_average)
+                },
+                'education_levels': level_stats,
+                'top_performing_grades': top_grades_list,
+                'recent_enrollments': recent_enrollments,
+                'timestamp': timezone.now().isoformat()
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Get education dashboard error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to fetch education dashboard data'
+        }, status=500)
+
+@csrf_exempt
+def update_education_level(request, level_key):
+    """Update education level information"""
+    try:
+        admin_user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        if request.method != 'POST':
+            return JsonResponse({
+                'success': False,
+                'error': 'Method not allowed'
+            }, status=405)
+        
+        # Get education level
+        try:
+            level = EducationLevel.objects.get(level_key=level_key)
+        except EducationLevel.DoesNotExist:
+            return JsonResponse({
+                'success': False,
+                'error': 'Education level not found'
+            }, status=404)
+        
+        data = json.loads(request.body)
+        
+        with transaction.atomic():
+            # Update level fields
+            update_fields = ['title', 'description', 'icon_name', 'color_gradient', 'order', 'is_active']
+            
+            for field in update_fields:
+                if field in data:
+                    setattr(level, field, data[field])
+            
+            level.save()
+            
+            # Create audit log
+            create_audit_log(
+                user=admin_user,
+                action_type='update',
+                model_name='EducationLevel',
+                object_id=level.id,
+                description=f'Updated education level: {level.title}',
+                request=request
+            )
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Education level updated successfully'
+        })
+        
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'Invalid JSON format'
+        }, status=400)
+    except Exception as e:
+        logger.error(f"Update education level error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to update education level'
+        }, status=500)
+
+@csrf_exempt
+def create_grade(request):
+    """Create a new grade/class"""
+    try:
+        admin_user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        if request.method != 'POST':
+            return JsonResponse({
+                'success': False,
+                'error': 'Method not allowed'
+            }, status=405)
+        
+        data = json.loads(request.body)
+        
+        # Validate required fields
+        required_fields = ['education_level_id', 'name', 'short_code']
+        for field in required_fields:
+            if not data.get(field):
+                return JsonResponse({
+                    'success': False,
+                    'error': f'{field.replace("_", " ").title()} is required'
+                }, status=400)
+        
+        # Get education level
+        try:
+            education_level = EducationLevel.objects.get(id=data['education_level_id'])
+        except EducationLevel.DoesNotExist:
+            return JsonResponse({
+                'success': False,
+                'error': 'Education level not found'
+            }, status=404)
+        
+        # Check if short code already exists
+        if GradeClass.objects.filter(short_code=data['short_code']).exists():
+            return JsonResponse({
+                'success': False,
+                'error': 'Short code already exists'
+            }, status=409)
+        
+        with transaction.atomic():
+            # Create grade
+            grade = GradeClass.objects.create(
+                education_level=education_level,
+                name=data['name'],
+                short_code=data['short_code'],
+                description=data.get('description', ''),
+                order=data.get('order', 0),
+                is_active=data.get('is_active', True)
+            )
+            
+            # Create grade statistics
+            GradeStats.objects.create(grade_class=grade)
+            
+            # Create audit log
+            create_audit_log(
+                user=admin_user,
+                action_type='create',
+                model_name='GradeClass',
+                object_id=grade.id,
+                description=f'Created grade: {grade.name}',
+                request=request
+            )
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Grade created successfully',
+            'grade_id': grade.id
+        })
+        
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'Invalid JSON format'
+        }, status=400)
+    except Exception as e:
+        logger.error(f"Create grade error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to create grade'
+        }, status=500)
+
+@csrf_exempt
+def assign_student_to_education_level(request, user_id):
+    """Assign a student to an education level and grade"""
+    try:
+        admin_user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        if request.method != 'POST':
+            return JsonResponse({
+                'success': False,
+                'error': 'Method not allowed'
+            }, status=405)
+        
+        data = json.loads(request.body)
+        
+        # Get student
+        try:
+            user = User.objects.get(id=user_id)
+            profile = UserProfile.objects.get(user=user)
+        except (User.DoesNotExist, UserProfile.DoesNotExist):
+            return JsonResponse({
+                'success': False,
+                'error': 'Student not found'
+            }, status=404)
+        
+        # Validate education level
+        if 'education_level_id' not in data:
+            return JsonResponse({
+                'success': False,
+                'error': 'Education level is required'
+            }, status=400)
+        
+        try:
+            education_level = EducationLevel.objects.get(id=data['education_level_id'])
+        except EducationLevel.DoesNotExist:
+            return JsonResponse({
+                'success': False,
+                'error': 'Education level not found'
+            }, status=404)
+        
+        with transaction.atomic():
+            # Update profile
+            profile.education_level = education_level
+            
+            # Update grade if provided
+            if 'grade_class_id' in data and data['grade_class_id']:
+                try:
+                    grade_class = GradeClass.objects.get(
+                        id=data['grade_class_id'],
+                        education_level=education_level
+                    )
+                    profile.grade_class = grade_class
+                except GradeClass.DoesNotExist:
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'Grade not found or does not belong to selected education level'
+                    }, status=404)
+            
+            profile.save()
+            
+            # Update education level statistics
+            stats, _ = EducationLevelStats.objects.get_or_create(education_level=education_level)
+            stats.update_statistics()
+            
+            # Update grade statistics if grade is assigned
+            if profile.grade_class:
+                grade_stats, _ = GradeStats.objects.get_or_create(grade_class=profile.grade_class)
+                grade_stats.update_statistics()
+            
+            # Create audit log
+            create_audit_log(
+                user=admin_user,
+                action_type='update',
+                model_name='UserProfile',
+                object_id=profile.id,
+                description=f'Assigned {profile.full_name} to {education_level.title}',
+                request=request
+            )
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Student assigned successfully'
+        })
+        
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'Invalid JSON format'
+        }, status=400)
+    except Exception as e:
+        logger.error(f"Assign student error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to assign student'
+        }, status=500)
+
+# Update the create_beneficiary function to include education level and grade
+@csrf_exempt
+def create_beneficiary(request):
+    """Create a new beneficiary user account with education level"""
+    try:
+        admin_user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        if request.method != 'POST':
+            return JsonResponse({
+                'success': False,
+                'error': 'Method not allowed'
+            }, status=405)
+        
+        # Handle multipart/form-data
+        data = request.POST
+        files = request.FILES
+        
+        # Required fields
+        required_fields = ['first_name', 'last_name', 'email', 'phone_number', 'school']
+        
+        for field in required_fields:
+            if not data.get(field):
+                return JsonResponse({
+                    'success': False,
+                    'error': f'{field.replace("_", " ").title()} is required'
+                }, status=400)
+        
+        email = data['email'].strip().lower()
+        
+        # Validate email
+        try:
+            validate_email(email)
+        except ValidationError:
+            return JsonResponse({
+                'success': False,
+                'error': 'Invalid email format'
+            }, status=400)
+        
+        # Check if user already exists
+        existing_user = User.objects.filter(email=email).first()
+        
+        with transaction.atomic():
+            user = None
+            profile = None
+            
+            if existing_user:
+                # User already exists, check if they already have a profile
+                try:
+                    profile = UserProfile.objects.get(user=existing_user)
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'A beneficiary with this email already exists'
+                    }, status=409)
+                except UserProfile.DoesNotExist:
+                    # User exists but doesn't have a profile, use existing user
+                    user = existing_user
+                    # Update user info
+                    user.first_name = data['first_name'].strip()
+                    user.last_name = data['last_name'].strip()
+                    user.save()
+                    
+                    # Generate a new password for existing user
+                    import secrets
+                    import string
+                    alphabet = string.ascii_letters + string.digits
+                    password = ''.join(secrets.choice(alphabet) for _ in range(12))
+                    user.set_password(password)
+                    user.save()
+            else:
+                # Create new user account
+                import secrets
+                import string
+                alphabet = string.ascii_letters + string.digits
+                password = ''.join(secrets.choice(alphabet) for _ in range(12))
+                
+                user = User.objects.create_user(
+                    username=email,
+                    email=email,
+                    password=password,
+                    first_name=data['first_name'].strip(),
+                    last_name=data['last_name'].strip(),
+                    is_active=True,
+                    is_staff=False,
+                    is_superuser=False
+                )
+            
+            # Get education level and grade if provided
+            education_level = None
+            grade_class = None
+            
+            if data.get('education_level_id'):
+                try:
+                    education_level = EducationLevel.objects.get(id=data['education_level_id'])
+                except EducationLevel.DoesNotExist:
+                    pass
+            
+            if data.get('grade_class_id') and education_level:
+                try:
+                    grade_class = GradeClass.objects.get(
+                        id=data['grade_class_id'],
+                        education_level=education_level
+                    )
+                except GradeClass.DoesNotExist:
+                    pass
+            
+            # Check if profile already exists (should not happen with our check above, but just in case)
+            try:
+                profile = UserProfile.objects.get(user=user)
+                # Update existing profile
+                update_fields = [
+                    'phone_number', 'date_of_birth', 'gender', 'national_id',
+                    'address', 'county', 'constituency', 'school', 'admission_number',
+                    'school_type', 'guardian_name', 'guardian_phone', 'guardian_email',
+                    'guardian_relationship', 'emergency_contact_name', 'emergency_contact_phone',
+                    'sponsorship_status'
+                ]
+                
+                for field in update_fields:
+                    if data.get(field):
+                        setattr(profile, field, data[field])
+                
+                # Update education level and grade class
+                if education_level:
+                    profile.education_level = education_level
+                if grade_class:
+                    profile.grade_class = grade_class
+                
+                profile.is_verified = True
+                profile.verification_level = 3
+                profile.role = 'beneficiary'
+                
+                profile.save()
+            except UserProfile.DoesNotExist:
+                # Create new user profile
+                profile_data = {
+                    'user': user,
+                    'role': 'beneficiary',
+                    'education_level': education_level,
+                    'grade_class': grade_class,
+                    'phone_number': data['phone_number'].strip(),
+                    'date_of_birth': data.get('date_of_birth') if data.get('date_of_birth') else None,
+                    'gender': data.get('gender'),
+                    'national_id': data.get('national_id'),
+                    'address': data.get('address'),
+                    'county': data.get('county'),
+                    'constituency': data.get('constituency'),
+                    'school': data['school'].strip(),
+                    'admission_number': data.get('admission_number'),
+                    'school_type': data.get('school_type'),
+                    'guardian_name': data.get('guardian_name'),
+                    'guardian_phone': data.get('guardian_phone'),
+                    'guardian_email': data.get('guardian_email'),
+                    'guardian_relationship': data.get('guardian_relationship'),
+                    'emergency_contact_name': data.get('emergency_contact_name'),
+                    'emergency_contact_phone': data.get('emergency_contact_phone'),
+                    'sponsorship_status': data.get('sponsorship_status', 'active'),
+                    'sponsorship_start_date': data.get('sponsorship_start_date') if data.get('sponsorship_start_date') else None,
+                    'is_verified': True,
+                    'verification_level': 3
+                }
+                
+                profile = UserProfile.objects.create(**profile_data)
+            
+            # Handle profile image upload
+            profile_image = files.get('profile_image')
+            if profile_image:
+                # Validate image
+                if profile_image.size > 5 * 1024 * 1024:
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'Profile image must be less than 5MB'
+                    }, status=400)
+                
+                # Validate file type
+                allowed_extensions = ['.jpg', '.jpeg', '.png', '.gif']
+                file_name = profile_image.name.lower()
+                file_extension = os.path.splitext(file_name)[1]
+                
+                if file_extension not in allowed_extensions:
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'Profile image must be JPG, PNG, or GIF'
+                    }, status=400)
+                
+                # Save image
+                import uuid
+                unique_filename = f"{uuid.uuid4()}{file_extension}"
+                file_path = default_storage.save(
+                    f'profile_images/{unique_filename}',
+                    ContentFile(profile_image.read())
+                )
+                profile.profile_image = file_path
+                profile.save()
+            
+            # Update education level statistics if level is assigned
+            if education_level:
+                stats, _ = EducationLevelStats.objects.get_or_create(education_level=education_level)
+                stats.update_statistics()
+            
+            # Update grade statistics if grade is assigned
+            if grade_class:
+                grade_stats, _ = GradeStats.objects.get_or_create(grade_class=grade_class)
+                grade_stats.update_statistics()
+            
+            # Create audit log
+            create_audit_log(
+                user=admin_user,
+                action_type='create',
+                model_name='UserProfile',
+                object_id=profile.id,
+                description=f'Created/updated beneficiary account for {profile.full_name}',
+                request=request
+            )
+            
+            # Create notification for admin
+            AdminNotification.objects.create(
+                title='New Beneficiary Created',
+                message=f'Successfully created beneficiary account for {profile.full_name}',
+                notification_type='system',
+                recipient=admin_user,
+                related_object_id=profile.id,
+                related_object_type='UserProfile'
+            )
+        
+        # Prepare response
+        return JsonResponse({
+            'success': True,
+            'message': 'Beneficiary created successfully',
+            'beneficiary': {
+                'id': user.id,
+                'full_name': profile.full_name,
+                'email': user.email,
+                'username': user.username,
+                'education_level': {
+                    'id': education_level.id if education_level else None,
+                    'title': education_level.title if education_level else None
+                },
+                'grade_class': {
+                    'id': grade_class.id if grade_class else None,
+                    'name': grade_class.name if grade_class else None
+                },
+                'profile_image_url': request.build_absolute_uri(profile.profile_image.url) if profile.profile_image else None
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Create beneficiary error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': f'Failed to create beneficiary: {str(e)}'
+        }, status=500)
+
+# Update the get_beneficiaries function to filter by education level
+@csrf_exempt
+def get_beneficiaries(request):
+    """Get list of beneficiaries with filtering and pagination"""
+    try:
+        user, error_response = verify_admin(request)
+        if error_response:
+            return error_response
+        
+        # Get query parameters
+        page = int(request.GET.get('page', 1))
+        limit = int(request.GET.get('limit', 10))
+        search = request.GET.get('search', '')
+        status = request.GET.get('status', '')
+        county = request.GET.get('county', '')
+        grade_class_id = request.GET.get('grade_class_id', '')  # Changed from 'grade'
+        sort_by = request.GET.get('sort_by', '-registration_date')
+        
+        # Build query
+        query = Q(role='beneficiary')
+        
+        if search:
+            query &= (
+                Q(user__first_name__icontains=search) |
+                Q(user__last_name__icontains=search) |
+                Q(user__email__icontains=search) |
+                Q(school__icontains=search) |
+                Q(admission_number__icontains=search)
+            )
+        
+        if status:
+            query &= Q(sponsorship_status=status)
+        
+        if county:
+            query &= Q(county__icontains=county)
+        
+        if grade_class_id:
+            query &= Q(grade_class_id=grade_class_id)
+        
+        # Get beneficiaries with user data
+        beneficiaries = UserProfile.objects.filter(query).select_related(
+            'user', 'education_level', 'grade_class'
+        ).order_by(sort_by)
+        
+        # Calculate summary stats
+        total_count = beneficiaries.count()
+        active_count = beneficiaries.filter(sponsorship_status='active').count()
+        pending_count = beneficiaries.filter(is_verified=False).count()
+        
+        # Paginate
+        paginator = Paginator(beneficiaries, limit)
+        page_obj = paginator.get_page(page)
+        
+        # Format response
+        beneficiaries_list = []
+        for profile in page_obj:
+            # Get latest academic performance
+            latest_academic = AcademicSummary.objects.filter(
+                user=profile.user
+            ).order_by('-year', '-term').first()
+            
+            # Get total fees and payments
+            fee_statements = FeeStatement.objects.filter(user=profile.user)
+            total_fees = fee_statements.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
+            total_paid = fee_statements.aggregate(total=Sum('amount_paid'))['total'] or Decimal('0')
+            
+            beneficiaries_list.append({
+                'id': profile.user.id,
+                'full_name': profile.full_name,
+                'email': profile.user.email,
+                'phone_number': profile.phone_number,
+                'school': profile.school,
+                'grade': profile.grade_class.name if profile.grade_class else None,  # Fixed: Use grade_class
+                'county': profile.county,
+                'sponsorship_status': profile.sponsorship_status,
+                'is_verified': profile.is_verified,
+                'registration_date': profile.registration_date.isoformat(),
+                'years_in_program': profile.years_in_program,
+                'academic_performance': float(latest_academic.average_score) if latest_academic else None,
+                'academic_rank': latest_academic.class_rank if latest_academic else None,  # Added rank
+                'total_fees': str(total_fees),
+                'total_paid': str(total_paid),
+                'balance': str(total_fees - total_paid),
+                'profile_image_url': request.build_absolute_uri(profile.profile_image.url) if profile.profile_image else None,
+                'education_level': {
+                    'id': profile.education_level.id if profile.education_level else None,
+                    'title': profile.education_level.title if profile.education_level else None,
+                    'key': profile.education_level.level_key if profile.education_level else None
+                } if profile.education_level else None,
+                'grade_class': {
+                    'id': profile.grade_class.id if profile.grade_class else None,
+                    'name': profile.grade_class.name if profile.grade_class else None
+                } if profile.grade_class else None
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'beneficiaries': beneficiaries_list,
+            'pagination': {
+                'current_page': page_obj.number,
+                'total_pages': paginator.num_pages,
+                'total_count': paginator.count,
+                'has_next': page_obj.has_next(),
+                'has_previous': page_obj.has_previous()
+            },
+            'summary': {
+                'total': total_count,
+                'active': active_count,
+                'pending_verification': pending_count
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Get beneficiaries error: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to fetch beneficiaries'
+        }, status=500)
+
+# Update the admin_dashboard to include education level statistics
 @csrf_exempt
 def admin_dashboard(request):
-    """Get minimal, essential admin dashboard data - REAL DATA ONLY"""
+    """Get admin dashboard data including education level overview"""
     try:
         user, error_response = verify_admin(request)
         if error_response:
@@ -85,7 +1130,7 @@ def admin_dashboard(request):
         
         today = timezone.now().date()
         
-        # ESSENTIAL STATISTICS - Real counts only, no averages
+        # ESSENTIAL STATISTICS
         try:
             # Beneficiary counts
             total_beneficiaries = UserProfile.objects.filter(role='beneficiary').count()
@@ -127,6 +1172,20 @@ def admin_dashboard(request):
             # Payment status counts
             verified_payments = Payment.objects.filter(status='verified').count()
             
+            # Education level distribution
+            education_levels = EducationLevel.objects.filter(is_active=True)
+            level_distribution = []
+            
+            for level in education_levels:
+                stats, _ = EducationLevelStats.objects.get_or_create(education_level=level)
+                level_distribution.append({
+                    'level': level.title,
+                    'key': level.level_key,
+                    'total_students': stats.total_students,
+                    'color_gradient': level.color_gradient,
+                    'icon': level.icon_name
+                })
+            
         except Exception as e:
             logger.error(f"Error calculating stats: {e}")
             # Set defaults
@@ -141,6 +1200,7 @@ def admin_dashboard(request):
             approved_documents = 0
             rejected_documents = 0
             verified_payments = 0
+            level_distribution = []
         
         # RECENT ACTIVITIES - Last 10 items
         recent_activities = []
@@ -153,7 +1213,7 @@ def admin_dashboard(request):
                     'type': 'document',
                     'title': f"Document uploaded: {doc.name}",
                     'user': f"{doc.user.first_name} {doc.user.last_name}".strip() or doc.user.username,
-                    'time': doc.uploaded_at,
+                    'time': doc.uploaded_at.isoformat(),
                     'status': doc.status
                 })
             
@@ -165,7 +1225,7 @@ def admin_dashboard(request):
                     'type': 'payment',
                     'title': f"Payment submitted: KES {payment.amount}",
                     'user': f"{payment.user.first_name} {payment.user.last_name}".strip() or payment.user.username,
-                    'time': payment.created_at,
+                    'time': payment.created_at.isoformat(),
                     'status': payment.status
                 })
             
@@ -195,8 +1255,8 @@ def admin_dashboard(request):
                 upcoming_due_dates.append({
                     'id': fee.id,
                     'title': f"{fee.user.first_name}'s {fee.term} fees",
-                    'due_date': fee.due_date,
-                    'amount': fee.balance,
+                    'due_date': fee.due_date.isoformat(),
+                    'amount': str(fee.balance),
                     'status': fee.status
                 })
         except Exception as e:
@@ -256,6 +1316,7 @@ def admin_dashboard(request):
                     # System stats
                     'unread_notifications': unread_notifications
                 },
+                'education_level_distribution': level_distribution,
                 'pending_reviews': pending_reviews,
                 'recent_activities': recent_activities,
                 'upcoming_due_dates': upcoming_due_dates,
@@ -276,8 +1337,8 @@ def admin_dashboard(request):
             'error': 'Failed to load dashboard data'
         }, status=500)
 
-# Remove the get_analytics_data and get_detailed_stats functions - we don't need them
-# Keep only the essential functions we actually use
+# Keep all other existing view functions (review_document, verify_payment, etc.) 
+# ... [Keep all your existing view functions] ...
 
 def get_relative_time(dt):
     """Helper function to get relative time string"""
@@ -307,197 +1368,6 @@ def get_relative_time(dt):
     except Exception as e:
         logger.error(f"Error calculating relative time: {e}")
         return "Recently"
-
-
-
-from django.contrib.auth.models import User
-from django.core.validators import validate_email
-from django.core.exceptions import ValidationError
-import re
-from django.core.files.storage import default_storage
-from django.core.files.base import ContentFile
-import os
-
-@csrf_exempt
-def create_beneficiary(request):
-    """Create a new beneficiary user account"""
-    try:
-        admin_user, error_response = verify_admin(request)
-        if error_response:
-            return error_response
-        
-        if request.method != 'POST':
-            return JsonResponse({
-                'success': False,
-                'error': 'Method not allowed'
-            }, status=405)
-        
-        # Handle multipart/form-data
-        data = request.POST
-        files = request.FILES
-        
-        print("Received data:", dict(data))
-        print("Received files:", dict(files))
-        
-        # Debug: Log all form data
-        for key, value in data.items():
-            print(f"{key}: {value}")
-        
-        # Required fields
-        required_fields = ['first_name', 'last_name', 'email', 'phone_number', 'school']
-        
-        for field in required_fields:
-            if not data.get(field):
-                return JsonResponse({
-                    'success': False,
-                    'error': f'{field.replace("_", " ").title()} is required'
-                }, status=400)
-        
-        email = data['email'].strip().lower()
-        
-        # Validate email
-        try:
-            validate_email(email)
-        except ValidationError:
-            return JsonResponse({
-                'success': False,
-                'error': 'Invalid email format'
-            }, status=400)
-        
-        # Check if user already exists
-        if User.objects.filter(email=email).exists():
-            return JsonResponse({
-                'success': False,
-                'error': 'Email already registered'
-            }, status=409)
-        
-        if User.objects.filter(username=email).exists():
-            return JsonResponse({
-                'success': False,
-                'error': 'Username already exists'
-            }, status=409)
-        
-        # Generate a random password
-        import secrets
-        import string
-        alphabet = string.ascii_letters + string.digits
-        password = ''.join(secrets.choice(alphabet) for _ in range(12))
-        
-        with transaction.atomic():
-            # Create user account
-            user = User.objects.create_user(
-                username=email,
-                email=email,
-                password=password,
-                first_name=data['first_name'].strip(),
-                last_name=data['last_name'].strip(),
-                is_active=True,
-                is_staff=False,
-                is_superuser=False
-            )
-            
-            # Create user profile with all fields
-            profile_data = {
-                'user': user,
-                'role': 'beneficiary',
-                'phone_number': data['phone_number'].strip(),
-                'date_of_birth': data.get('date_of_birth') if data.get('date_of_birth') else None,
-                'gender': data.get('gender'),
-                'national_id': data.get('national_id'),
-                'address': data.get('address'),
-                'county': data.get('county'),
-                'constituency': data.get('constituency'),
-                'school': data['school'].strip(),
-                'grade': data.get('grade'),
-                'admission_number': data.get('admission_number'),
-                'school_type': data.get('school_type'),
-                'guardian_name': data.get('guardian_name'),
-                'guardian_phone': data.get('guardian_phone'),
-                'guardian_email': data.get('guardian_email'),
-                'guardian_relationship': data.get('guardian_relationship'),
-                'emergency_contact_name': data.get('emergency_contact_name'),
-                'emergency_contact_phone': data.get('emergency_contact_phone'),
-                'sponsorship_status': data.get('sponsorship_status', 'active'),
-                'sponsorship_start_date': data.get('sponsorship_start_date') if data.get('sponsorship_start_date') else None,
-                'is_verified': True,
-                'verification_level': 3
-            }
-            
-            profile = UserProfile.objects.create(**profile_data)
-            
-            # Handle profile image upload
-            profile_image = files.get('profile_image')
-            if profile_image:
-                print(f"Processing profile image: {profile_image.name}, size: {profile_image.size}")
-                
-                # Validate image
-                if profile_image.size > 5 * 1024 * 1024:
-                    return JsonResponse({
-                        'success': False,
-                        'error': 'Profile image must be less than 5MB'
-                    }, status=400)
-                
-                # Validate file type
-                allowed_extensions = ['.jpg', '.jpeg', '.png', '.gif']
-                file_name = profile_image.name.lower()
-                file_extension = os.path.splitext(file_name)[1]
-                
-                if file_extension not in allowed_extensions:
-                    return JsonResponse({
-                        'success': False,
-                        'error': 'Profile image must be JPG, PNG, or GIF'
-                    }, status=400)
-                
-                # Save image
-                import uuid
-                unique_filename = f"{uuid.uuid4()}{file_extension}"
-                file_path = default_storage.save(
-                    f'profile_images/{unique_filename}',
-                    ContentFile(profile_image.read())
-                )
-                profile.profile_image = file_path
-                profile.save()
-            
-            # Create audit log
-            create_audit_log(
-                user=admin_user,
-                action_type='create',
-                model_name='UserProfile',
-                object_id=profile.id,
-                description=f'Created beneficiary account for {profile.full_name}',
-                request=request
-            )
-            
-            # Create notification for admin
-            AdminNotification.objects.create(
-                title='New Beneficiary Created',
-                message=f'Successfully created beneficiary account for {profile.full_name}',
-                notification_type='system',
-                recipient=admin_user,
-                related_object_id=profile.id,
-                related_object_type='UserProfile'
-            )
-        
-        # Prepare response
-        return JsonResponse({
-            'success': True,
-            'message': 'Beneficiary created successfully',
-            'beneficiary': {
-                'id': user.id,
-                'full_name': profile.full_name,
-                'email': user.email,
-                'username': user.username,
-                'temporary_password': password,
-                'profile_image_url': request.build_absolute_uri(profile.profile_image.url) if profile.profile_image else None
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Create beneficiary error: {str(e)}", exc_info=True)
-        return JsonResponse({
-            'success': False,
-            'error': f'Failed to create beneficiary: {str(e)}'
-        }, status=500)
 
 @csrf_exempt
 def send_welcome_email(request, user_id):
@@ -577,112 +1447,6 @@ def send_welcome_email(request, user_id):
 
 
 
-
-@csrf_exempt
-def get_beneficiaries(request):
-    """Get list of beneficiaries with filtering and pagination"""
-    try:
-        user, error_response = verify_admin(request)
-        if error_response:
-            return error_response
-        
-        # Get query parameters
-        page = int(request.GET.get('page', 1))
-        limit = int(request.GET.get('limit', 10))
-        search = request.GET.get('search', '')
-        status = request.GET.get('status', '')
-        county = request.GET.get('county', '')
-        grade = request.GET.get('grade', '')
-        sort_by = request.GET.get('sort_by', '-registration_date')
-        
-        # Build query
-        query = Q(role='beneficiary')
-        
-        if search:
-            query &= (
-                Q(user__first_name__icontains=search) |
-                Q(user__last_name__icontains=search) |
-                Q(user__email__icontains=search) |
-                Q(school__icontains=search) |
-                Q(admission_number__icontains=search)
-            )
-        
-        if status:
-            query &= Q(sponsorship_status=status)
-        
-        if county:
-            query &= Q(county__icontains=county)
-        
-        if grade:
-            query &= Q(grade__icontains=grade)
-        
-        # Get beneficiaries with user data
-        beneficiaries = UserProfile.objects.filter(query).select_related('user').order_by(sort_by)
-        
-        # Calculate summary stats
-        total_count = beneficiaries.count()
-        active_count = beneficiaries.filter(sponsorship_status='active').count()
-        pending_count = beneficiaries.filter(is_verified=False).count()
-        
-        # Paginate
-        paginator = Paginator(beneficiaries, limit)
-        page_obj = paginator.get_page(page)
-        
-        # Format response
-        beneficiaries_list = []
-        for profile in page_obj:
-            # Get latest academic performance
-            latest_academic = AcademicSummary.objects.filter(
-                user=profile.user
-            ).order_by('-year', '-term').first()
-            
-            # Get total fees and payments
-            fee_statements = FeeStatement.objects.filter(user=profile.user)
-            total_fees = fee_statements.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
-            total_paid = fee_statements.aggregate(total=Sum('amount_paid'))['total'] or Decimal('0')
-            
-            beneficiaries_list.append({
-                'id': profile.user.id,
-                'full_name': profile.full_name,
-                'email': profile.user.email,
-                'phone_number': profile.phone_number,
-                'school': profile.school,
-                'grade': profile.grade,
-                'county': profile.county,
-                'sponsorship_status': profile.sponsorship_status,
-                'is_verified': profile.is_verified,
-                'registration_date': profile.registration_date.isoformat(),
-                'years_in_program': profile.years_in_program,
-                'academic_performance': float(latest_academic.average_score) if latest_academic else None,
-                'total_fees': str(total_fees),
-                'total_paid': str(total_paid),
-                'balance': str(total_fees - total_paid),
-                'profile_image_url': request.build_absolute_uri(profile.profile_image.url) if profile.profile_image else None
-            })
-        
-        return JsonResponse({
-            'success': True,
-            'beneficiaries': beneficiaries_list,
-            'pagination': {
-                'current_page': page_obj.number,
-                'total_pages': paginator.num_pages,
-                'total_count': paginator.count,
-                'has_next': page_obj.has_next(),
-                'has_previous': page_obj.has_previous()
-            },
-            'summary': {
-                'total': total_count,
-                'active': active_count,
-                'pending_verification': pending_count
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Get beneficiaries error: {str(e)}", exc_info=True)
-        return JsonResponse({
-            'success': False,
-            'error': 'Failed to fetch beneficiaries'
-        }, status=500)
 
 @csrf_exempt
 def get_beneficiary_detail(request, user_id):
@@ -817,7 +1581,12 @@ def get_beneficiary_detail(request, user_id):
                 'county': profile.county,
                 'constituency': profile.constituency,
                 'school': profile.school,
-                'grade': profile.grade,
+                'grade': profile.grade_class.name if profile.grade_class else None,  # Fixed: Use grade_class
+                'education_level': {
+                    'id': profile.education_level.id if profile.education_level else None,
+                    'title': profile.education_level.title if profile.education_level else None,
+                    'key': profile.education_level.level_key if profile.education_level else None
+                },
                 'admission_number': profile.admission_number,
                 'school_type': profile.school_type,
                 'guardian_name': profile.guardian_name,
@@ -860,10 +1629,16 @@ def get_beneficiary_detail(request, user_id):
             'error': 'Failed to fetch beneficiary details'
         }, status=500)
 
+# Update the update_beneficiary_details function with better error handling
 @csrf_exempt
-def update_beneficiary(request, user_id):
-    """Update beneficiary information"""
+def update_beneficiary_details(request, user_id):
+    """Update beneficiary details including profile image"""
     try:
+        logger.info(f"Update beneficiary request for user_id: {user_id}")
+        logger.info(f"Method: {request.method}")
+        logger.info(f"POST data keys: {list(request.POST.keys()) if request.POST else 'No POST data'}")
+        logger.info(f"FILES keys: {list(request.FILES.keys()) if request.FILES else 'No FILES data'}")
+        
         admin_user, error_response = verify_admin(request)
         if error_response:
             return error_response
@@ -878,32 +1653,36 @@ def update_beneficiary(request, user_id):
         try:
             beneficiary = User.objects.get(id=user_id)
             profile = UserProfile.objects.get(user=beneficiary)
+            logger.info(f"Found beneficiary: {beneficiary.email}, profile: {profile.id}")
         except (User.DoesNotExist, UserProfile.DoesNotExist):
+            logger.error(f"Beneficiary not found: user_id={user_id}")
             return JsonResponse({
                 'success': False,
                 'error': 'Beneficiary not found'
             }, status=404)
         
-        data = json.loads(request.body)
+        # Handle multipart/form-data
+        data = request.POST
+        files = request.FILES
         
         with transaction.atomic():
             # Update user fields
-            if 'full_name' in data:
-                full_name = data['full_name'].strip()
-                name_parts = full_name.split(' ', 1)
-                beneficiary.first_name = name_parts[0]
-                beneficiary.last_name = name_parts[1] if len(name_parts) > 1 else ''
+            if data.get('first_name') or data.get('last_name'):
+                if data.get('first_name'):
+                    beneficiary.first_name = data['first_name'].strip()
+                    logger.info(f"Updating first_name to: {data['first_name'].strip()}")
+                if data.get('last_name'):
+                    beneficiary.last_name = data['last_name'].strip()
+                    logger.info(f"Updating last_name to: {data['last_name'].strip()}")
                 beneficiary.save()
             
             # Update profile fields
             update_fields = [
                 'phone_number', 'date_of_birth', 'gender', 'national_id',
-                'address', 'county', 'constituency', 'school', 'grade',
-                'admission_number', 'school_type', 'guardian_name',
-                'guardian_phone', 'guardian_email', 'guardian_relationship',
-                'emergency_contact_name', 'emergency_contact_phone',
-                'sponsorship_status', 'sponsorship_start_date', 'sponsorship_end_date',
-                'is_verified', 'verification_level'
+                'address', 'county', 'constituency', 'school', 'admission_number',
+                'school_type', 'guardian_name', 'guardian_phone', 'guardian_email',
+                'guardian_relationship', 'emergency_contact_name', 'emergency_contact_phone',
+                'sponsorship_status', 'is_verified'
             ]
             
             for field in update_fields:
@@ -912,8 +1691,88 @@ def update_beneficiary(request, user_id):
                     if value == '':
                         value = None
                     setattr(profile, field, value)
+                    logger.info(f"Updating {field} to: {value}")
+            
+            # Handle boolean field for is_verified
+            if 'is_verified' in data:
+                profile.is_verified = data['is_verified'].lower() == 'true'
+                logger.info(f"Setting is_verified to: {profile.is_verified}")
+            
+            # Update education level and grade if provided
+            if data.get('education_level_id'):
+                try:
+                    education_level = EducationLevel.objects.get(id=data['education_level_id'])
+                    profile.education_level = education_level
+                    logger.info(f"Setting education_level to: {education_level.title}")
+                except EducationLevel.DoesNotExist:
+                    logger.warning(f"Education level not found: id={data['education_level_id']}")
+            
+            if data.get('grade_class_id'):
+                try:
+                    grade_class = GradeClass.objects.get(id=data['grade_class_id'])
+                    # Don't check education level match for now to simplify
+                    profile.grade_class = grade_class
+                    logger.info(f"Setting grade_class to: {grade_class.name}")
+                except GradeClass.DoesNotExist:
+                    logger.warning(f"Grade class not found: id={data['grade_class_id']}")
+            
+            # Handle profile image upload
+            profile_image = files.get('profile_image')
+            if profile_image:
+                logger.info(f"Processing profile image upload: {profile_image.name}, size: {profile_image.size}")
+                # Validate image
+                if profile_image.size > 5 * 1024 * 1024:
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'Profile image must be less than 5MB'
+                    }, status=400)
+                
+                # Validate file type
+                allowed_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+                file_name = profile_image.name.lower()
+                file_extension = os.path.splitext(file_name)[1]
+                
+                if file_extension not in allowed_extensions:
+                    return JsonResponse({
+                        'success': False,
+                        'error': 'Profile image must be JPG, PNG, GIF, or WebP'
+                    }, status=400)
+                
+                # Delete old image if exists
+                if profile.profile_image:
+                    try:
+                        if os.path.isfile(profile.profile_image.path):
+                            os.remove(profile.profile_image.path)
+                            logger.info(f"Deleted old profile image: {profile.profile_image.path}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete old profile image: {e}")
+                
+                # Save new image
+                import uuid
+                unique_filename = f"{uuid.uuid4()}{file_extension}"
+                file_path = default_storage.save(
+                    f'profile_images/{unique_filename}',
+                    ContentFile(profile_image.read())
+                )
+                profile.profile_image = file_path
+                logger.info(f"Saved new profile image: {file_path}")
             
             profile.save()
+            logger.info(f"Profile saved successfully")
+            
+            # Update education level statistics if level changed
+            if 'education_level_id' in data or 'grade_class_id' in data:
+                if profile.education_level:
+                    stats, _ = EducationLevelStats.objects.get_or_create(
+                        education_level=profile.education_level
+                    )
+                    stats.update_statistics()
+                
+                if profile.grade_class:
+                    grade_stats, _ = GradeStats.objects.get_or_create(
+                        grade_class=profile.grade_class
+                    )
+                    grade_stats.update_statistics()
             
             # Create audit log
             create_audit_log(
@@ -924,22 +1783,47 @@ def update_beneficiary(request, user_id):
                 description=f'Updated beneficiary profile for {profile.full_name}',
                 request=request
             )
+            
+            # Create notification
+            AdminNotification.objects.create(
+                title='Beneficiary Updated',
+                message=f'Beneficiary {profile.full_name} profile has been updated',
+                notification_type='system',
+                recipient=admin_user,
+                related_object_id=profile.id,
+                related_object_type='UserProfile'
+            )
+        
+        # Build image URL properly
+        profile_image_url = None
+        if profile.profile_image:
+            try:
+                # Check if file exists before building URL
+                if default_storage.exists(profile.profile_image.name):
+                    profile_image_url = request.build_absolute_uri(profile.profile_image.url)
+                    logger.info(f"Profile image URL: {profile_image_url}")
+                else:
+                    logger.warning(f"Profile image file not found: {profile.profile_image.name}")
+            except Exception as e:
+                logger.error(f"Error building profile image URL: {e}")
         
         return JsonResponse({
             'success': True,
-            'message': 'Beneficiary updated successfully'
+            'message': 'Beneficiary updated successfully',
+            'beneficiary': {
+                'id': beneficiary.id,
+                'full_name': profile.full_name,
+                'email': beneficiary.email,
+                'profile_image_url': profile_image_url,
+                'updated_at': profile.last_updated.isoformat()
+            }
         })
         
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON format'
-        }, status=400)
     except Exception as e:
         logger.error(f"Update beneficiary error: {str(e)}", exc_info=True)
         return JsonResponse({
             'success': False,
-            'error': 'Failed to update beneficiary'
+            'error': f'Failed to update beneficiary: {str(e)}'
         }, status=500)
 
 

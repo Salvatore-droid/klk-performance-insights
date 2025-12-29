@@ -729,3 +729,407 @@ class AcademicPerformance(models.Model):
     
     def __str__(self):
         return f"{self.user.username} - {self.term} {self.year}"
+
+
+from django.db import models
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
+
+# Education Level Model
+class EducationLevel(models.Model):
+    """Education level categories (pre-school, primary, secondary, etc.)"""
+    LEVEL_CHOICES = [
+        ('pre_school', 'Pre-School'),
+        ('primary', 'Primary'),
+        ('secondary', 'Secondary'),
+        ('university', 'University/College'),
+        ('vocational', 'Vocational'),
+    ]
+    
+    level_key = models.CharField(max_length=50, choices=LEVEL_CHOICES, unique=True)
+    title = models.CharField(max_length=100)
+    description = models.TextField()
+    icon_name = models.CharField(max_length=50, default='school')  # For Lucide React icons
+    color_gradient = models.CharField(max_length=100, default='from-blue-500 to-cyan-500')
+    order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['order']
+        verbose_name = "Education Level"
+        verbose_name_plural = "Education Levels"
+    
+    def __str__(self):
+        return self.title
+    
+    @property
+    def total_students(self):
+        """Get total students in this education level"""
+        return self.students.filter(education_level=self).count()
+    
+    @property
+    def active_students(self):
+        """Get active students in this education level"""
+        return self.students.filter(
+            education_level=self,
+            sponsorship_status='active'
+        ).count()
+
+class GradeClass(models.Model):
+    """Grade/Class within an education level"""
+    education_level = models.ForeignKey(EducationLevel, on_delete=models.CASCADE, related_name='grades')
+    name = models.CharField(max_length=100)  # e.g., "Grade 1", "Form 1", "Year 1"
+    short_code = models.CharField(max_length=20, unique=True)
+    description = models.TextField(blank=True, null=True)
+    order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['education_level', 'order']
+        verbose_name = "Grade/Class"
+        verbose_name_plural = "Grades/Classes"
+        unique_together = ['education_level', 'name']
+    
+    def __str__(self):
+        return f"{self.education_level.title} - {self.name}"
+
+# Update UserProfile model to include education level and grade
+class UserProfile(models.Model):
+    """Extended user profile for Kids League Kenya"""
+    ROLE_CHOICES = [
+        ('admin', 'Administrator'),
+        ('beneficiary', 'Beneficiary'),
+        ('staff', 'Staff Member'),
+    ]
+    
+    GENDER_CHOICES = [
+        ('male', 'Male'),
+        ('female', 'Female'),
+        ('other', 'Other'),
+        ('prefer_not_to_say', 'Prefer not to say'),
+    ]
+    
+    # Education level and grade fields
+    education_level = models.ForeignKey(EducationLevel, on_delete=models.SET_NULL, 
+                                       null=True, blank=True, related_name='students')
+    grade_class = models.ForeignKey(GradeClass, on_delete=models.SET_NULL,
+                                   null=True, blank=True, related_name='students')
+    
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='beneficiary')
+    
+    # Personal Information
+    phone_number = models.CharField(max_length=20, blank=True, null=True)
+    date_of_birth = models.DateField(blank=True, null=True)
+    gender = models.CharField(max_length=20, choices=GENDER_CHOICES, blank=True, null=True)
+    national_id = models.CharField(max_length=20, blank=True, null=True)
+    
+    # Address Information
+    address = models.TextField(blank=True, null=True)
+    county = models.CharField(max_length=100, blank=True, null=True)
+    constituency = models.CharField(max_length=100, blank=True, null=True)
+    
+    # School Information
+    school = models.CharField(max_length=200, blank=True, null=True)
+    admission_number = models.CharField(max_length=50, blank=True, null=True)
+    school_type = models.CharField(max_length=50, blank=True, null=True)
+    
+    # Guardian Information
+    guardian_name = models.CharField(max_length=100, blank=True, null=True)
+    guardian_phone = models.CharField(max_length=20, blank=True, null=True)
+    guardian_email = models.EmailField(blank=True, null=True)
+    guardian_relationship = models.CharField(max_length=50, blank=True, null=True)
+    
+    # Emergency Contact
+    emergency_contact_name = models.CharField(max_length=100, blank=True, null=True)
+    emergency_contact_phone = models.CharField(max_length=20, blank=True, null=True)
+    
+    # Profile Status
+    is_verified = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    verification_level = models.IntegerField(default=0)
+    
+    # Sponsorship Information
+    sponsorship_status = models.CharField(max_length=50, default='active')
+    sponsorship_start_date = models.DateField(blank=True, null=True)
+    sponsorship_end_date = models.DateField(blank=True, null=True)
+    
+    # Profile Image
+    profile_image = models.ImageField(upload_to='profile_images/%Y/%m/%d/', null=True, blank=True)
+    
+    # Academic performance cache for quick access
+    current_average_score = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    current_attendance = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    
+    # Timestamps
+    registration_date = models.DateTimeField(auto_now_add=True)
+    last_updated = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "User Profile"
+        verbose_name_plural = "User Profiles"
+        ordering = ['-registration_date']
+        indexes = [
+            models.Index(fields=['education_level', 'grade_class']),
+            models.Index(fields=['sponsorship_status']),
+            models.Index(fields=['county']),
+        ]
+    
+    def __str__(self):
+        return f"{self.user.email} - {self.role}"
+    
+    @property
+    def full_name(self):
+        """Get user's full name"""
+        full_name = f"{self.user.first_name} {self.user.last_name}".strip()
+        return full_name or self.user.username
+    
+    @property
+    def email(self):
+        """Get user's email"""
+        return self.user.email
+    
+    @property
+    def years_in_program(self):
+        """Calculate years in sponsorship program"""
+        if self.sponsorship_start_date:
+            from datetime import date
+            today = date.today()
+            years = today.year - self.sponsorship_start_date.year
+            if today.month < self.sponsorship_start_date.month or (
+                today.month == self.sponsorship_start_date.month and 
+                today.day < self.sponsorship_start_date.day
+            ):
+                years -= 1
+            return max(years, 0)
+        return 0
+    
+    @property
+    def is_currently_sponsored(self):
+        """Check if user is currently sponsored"""
+        if not self.sponsorship_start_date:
+            return False
+        
+        from datetime import date
+        today = date.today()
+        
+        if self.sponsorship_status == 'active':
+            if self.sponsorship_end_date:
+                return today <= self.sponsorship_end_date
+            return True
+        
+        return self.sponsorship_status == 'conditional'
+    
+    @property
+    def grade_name(self):
+        """Get grade name for display"""
+        if self.grade_class:
+            return self.grade_class.name
+        return self.grade or "Not Assigned"
+    
+    def update_academic_stats(self):
+        """Update cached academic statistics"""
+        from django.db.models import Avg
+        latest_summary = AcademicSummary.objects.filter(user=self.user).order_by('-year', '-term').first()
+        if latest_summary:
+            self.current_average_score = latest_summary.average_score
+            self.current_attendance = latest_summary.attendance_percentage
+            self.save()
+
+# Education Level Statistics Model
+class EducationLevelStats(models.Model):
+    """Statistics for education levels (cached for performance)"""
+    education_level = models.OneToOneField(EducationLevel, on_delete=models.CASCADE, related_name='stats')
+    
+    # Student statistics
+    total_students = models.IntegerField(default=0)
+    active_students = models.IntegerField(default=0)
+    pending_verification = models.IntegerField(default=0)
+    new_this_month = models.IntegerField(default=0)
+    
+    # Academic statistics
+    average_performance = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    passing_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    
+    # Financial statistics
+    total_fees = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_aid_disbursed = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    
+    # Document statistics
+    pending_documents = models.IntegerField(default=0)
+    approved_documents = models.IntegerField(default=0)
+    
+    # Update timestamp
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "Education Level Statistics"
+        verbose_name_plural = "Education Level Statistics"
+    
+    def __str__(self):
+        return f"{self.education_level.title} Statistics"
+    
+    def update_statistics(self):
+        """Update all statistics for this education level"""
+        from django.db.models import Sum, Count, Avg, Q
+        from datetime import datetime, timedelta
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        current_month_start = today.replace(day=1)
+        
+        # Student counts
+        profiles = UserProfile.objects.filter(
+            education_level=self.education_level,
+            role='beneficiary'
+        )
+        
+        self.total_students = profiles.count()
+        self.active_students = profiles.filter(sponsorship_status='active').count()
+        self.pending_verification = profiles.filter(is_verified=False).count()
+        self.new_this_month = profiles.filter(
+            registration_date__gte=current_month_start
+        ).count()
+        
+        # Academic performance (average of latest academic summaries)
+        user_ids = profiles.values_list('user_id', flat=True)
+        latest_summaries = AcademicSummary.objects.filter(
+            user_id__in=user_ids
+        ).order_by('user_id', '-year', '-term').distinct('user_id')
+        
+        if latest_summaries.exists():
+            self.average_performance = latest_summaries.aggregate(
+                avg=Avg('average_score')
+            )['avg'] or 0
+            
+            # Calculate passing rate (students with >= 40% average)
+            passing_students = latest_summaries.filter(
+                average_score__gte=40
+            ).count()
+            if latest_summaries.count() > 0:
+                self.passing_rate = (passing_students / latest_summaries.count()) * 100
+        
+        # Financial statistics
+        fee_stats = FeeStatement.objects.filter(
+            user_id__in=user_ids
+        ).aggregate(
+            total_fees=Sum('total_amount'),
+            total_paid=Sum('amount_paid')
+        )
+        self.total_fees = fee_stats['total_fees'] or 0
+        self.total_paid = fee_stats['total_paid'] or 0
+        
+        aid_stats = Payment.objects.filter(
+            user_id__in=user_ids,
+            status='verified'
+        ).aggregate(total=Sum('amount'))
+        self.total_aid_disbursed = aid_stats['total'] or 0
+        
+        # Document statistics
+        self.pending_documents = Document.objects.filter(
+            user_id__in=user_ids,
+            status='pending'
+        ).count()
+        self.approved_documents = Document.objects.filter(
+            user_id__in=user_ids,
+            status='approved'
+        ).count()
+        
+        self.save()
+
+# Grade Statistics Model
+class GradeStats(models.Model):
+    """Statistics for individual grades"""
+    grade_class = models.OneToOneField(GradeClass, on_delete=models.CASCADE, related_name='stats')
+    total_students = models.IntegerField(default=0)
+    male_students = models.IntegerField(default=0)
+    female_students = models.IntegerField(default=0)
+    average_performance = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    average_attendance = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "Grade Statistics"
+        verbose_name_plural = "Grade Statistics"
+    
+    def __str__(self):
+        return f"{self.grade_class.name} Statistics"
+    
+    def update_statistics(self):
+        """Update grade statistics"""
+        profiles = UserProfile.objects.filter(grade_class=self.grade_class)
+        
+        self.total_students = profiles.count()
+        self.male_students = profiles.filter(gender='male').count()
+        self.female_students = profiles.filter(gender='female').count()
+        
+        # Calculate average performance
+        user_ids = profiles.values_list('user_id', flat=True)
+        latest_summaries = AcademicSummary.objects.filter(
+            user_id__in=user_ids
+        ).order_by('user_id', '-year', '-term').distinct('user_id')
+        
+        if latest_summaries.exists():
+            avg_stats = latest_summaries.aggregate(
+                avg_performance=Avg('average_score'),
+                avg_attendance=Avg('attendance_percentage')
+            )
+            self.average_performance = avg_stats['avg_performance'] or 0
+            self.average_attendance = avg_stats['avg_attendance'] or 0
+        
+        self.save()
+
+# Keep other models (Document, Message, FeeStatement, Payment, AcademicRecord, etc.)
+# ... [Keep all your existing models like Document, Message, FeeStatement, Payment, AcademicRecord, AcademicSummary, etc.] ...
+
+# Add signals to update education level statistics
+@receiver(post_save, sender=UserProfile)
+def update_education_stats_on_profile_change(sender, instance, **kwargs):
+    """Update education level statistics when profile changes"""
+    if instance.education_level:
+        stats, created = EducationLevelStats.objects.get_or_create(
+            education_level=instance.education_level
+        )
+        stats.update_statistics()
+    
+    if instance.grade_class:
+        grade_stats, created = GradeStats.objects.get_or_create(
+            grade_class=instance.grade_class
+        )
+        grade_stats.update_statistics()
+
+@receiver(post_save, sender=AcademicSummary)
+def update_education_stats_on_academic_change(sender, instance, **kwargs):
+    """Update education level statistics when academic performance changes"""
+    try:
+        profile = UserProfile.objects.get(user=instance.user)
+        if profile.education_level:
+            stats, created = EducationLevelStats.objects.get_or_create(
+                education_level=profile.education_level
+            )
+            stats.update_statistics()
+        
+        # Update user's cached academic stats
+        profile.update_academic_stats()
+        
+    except UserProfile.DoesNotExist:
+        pass
+
+@receiver(post_save, sender=Payment)
+@receiver(post_save, sender=Document)
+@receiver(post_save, sender=FeeStatement)
+def update_education_stats_on_related_change(sender, instance, **kwargs):
+    """Update education level statistics when related records change"""
+    try:
+        profile = UserProfile.objects.get(user=instance.user)
+        if profile.education_level:
+            stats, created = EducationLevelStats.objects.get_or_create(
+                education_level=profile.education_level
+            )
+            stats.update_statistics()
+    except (UserProfile.DoesNotExist, AttributeError):
+        pass
