@@ -248,16 +248,34 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   };
 
-  // API request helper with auth token
+  // API request helper with auth token - FIXED to handle FormData
   const apiRequest = useCallback(async <T = any>(
     endpoint: string, 
     options: RequestInit = {}
   ): Promise<{ data?: T; error?: string; response?: Response }> => {
-    const headers = {
-      'Content-Type': 'application/json',
-      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-      ...options.headers,
-    };
+    // Check if we're sending FormData
+    const isFormData = options.body instanceof FormData;
+    
+    // Create headers object
+    const headers = new Headers();
+    
+    // Only set Content-Type to JSON if it's not FormData
+    if (!isFormData) {
+      headers.append('Content-Type', 'application/json');
+    }
+    
+    // Add authorization if token exists
+    if (token) {
+      headers.append('Authorization', `Bearer ${token}`);
+    }
+    
+    // Add any custom headers from options
+    if (options.headers) {
+      const customHeaders = new Headers(options.headers);
+      customHeaders.forEach((value, key) => {
+        headers.append(key, value);
+      });
+    }
 
     try {
       const response = await fetch(`${API_BASE_URL}${endpoint}`, {
@@ -319,45 +337,4 @@ export const useAuth = () => {
     throw new Error('useAuth must be used within an AuthProvider');
   }
   return context;
-};
-
-// Standalone apiRequest function
-export const apiRequest = async <T = any>(
-  endpoint: string, 
-  options: RequestInit = {},
-  token?: string | null
-): Promise<{ data?: T; error?: string; response?: Response }> => {
-  const headers = {
-    'Content-Type': 'json',
-    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-    ...options.headers,
-  };
-
-  try {
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
-      headers,
-    });
-
-    // Try to parse JSON response
-    let data;
-    try {
-      data = await response.json();
-    } catch (e) {
-      // Response is not JSON
-      if (!response.ok) {
-        return { error: `Request failed with status ${response.status}`, response };
-      }
-      return { response };
-    }
-
-    if (!response.ok) {
-      return { error: data.error || `Request failed with status ${response.status}`, response };
-    }
-
-    return { data: data as T, response };
-  } catch (error) {
-    console.error('API request error:', error);
-    return { error: 'Network error. Please check your connection.' };
-  }
 };
