@@ -47,13 +47,22 @@ const Auth = () => {
 
   useEffect(() => {
     if (!loading && user && role) {
+      // Check if user's actual role matches their selection
+      if (role !== selectedUserType) {
+        toast({
+          title: 'Access Notice',
+          description: `You are logged in as ${role === 'admin' ? 'an Admin' : 'a Beneficiary'}. Redirecting to your dashboard.`,
+        });
+      }
+      
+      // Redirect based on actual database role, not UI selection
       if (role === 'admin') {
         navigate('/');
       } else {
         navigate('/portal');
       }
     }
-  }, [user, role, loading, navigate]);
+  }, [user, role, loading, navigate, selectedUserType, toast]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
